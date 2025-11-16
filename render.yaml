@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: telegram-thumbnail-bot
+    env: docker
+    plan: free
+    region: oregon
+    numInstances: 1
+    maxInstances: 1
+    autoDeploy: true
+    disk:
+      name: bot-storage
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: PORT
+        value: "10000"

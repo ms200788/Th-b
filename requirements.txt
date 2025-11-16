@@ -1,0 +1,8 @@
+aiogram==2.25.0
+aiohttp==3.8.6
+python-dotenv==1.0.1
+uvicorn==0.23.2
+fastapi==0.104.1
+pydantic==1.10.9
+aiofiles==23.1.0
+requests==2.31.0

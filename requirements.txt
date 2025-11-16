@@ -6,3 +6,4 @@ fastapi==0.104.1
 pydantic==1.10.9
 aiofiles==23.1.0
 requests==2.31.0
+aiosqlite==0.19.0

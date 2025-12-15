@@ -179,8 +179,22 @@ except Exception:
 # Async DB engine and session
 # ---------------------------
 
-engine = create_async_engine(DATABASE_URL, echo=False, future=True)
-AsyncSessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    future=True,
+    pool_pre_ping=True,      # REQUIRED for Neon
+    pool_recycle=300,        # REQUIRED for long-running bots
+    connect_args={
+        "ssl": "require"     # REQUIRED for Neon + asyncpg
+    }
+)
+
+AsyncSessionLocal = sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
 
 # ---------------------------
 # DB initialization & migrations

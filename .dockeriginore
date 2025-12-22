@@ -1,11 +1,3 @@
-.git
-.gitignore
-README.md
-.env
-*.pyc
 __pycache__
-*.log
-.DS_Store
-Dockerfile
-docker-compose.yml
-render.yaml
+*.pyc
+.env

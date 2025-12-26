@@ -262,12 +262,12 @@ def done(m):
 # ======================
 app = Flask(__name__)
 
-@app.route("/")
-def ok():
-    return "OK"
+@app.route('/health')
+def health():
+    return "OK", 200
 
 def run_web():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
 
 # ======================
 # RUN

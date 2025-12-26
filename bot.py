@@ -1,7 +1,7 @@
 import os
 import re
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -59,6 +59,7 @@ shared_chats = {}
 
 blockquote_sessions = {}
 button_sessions = {}
+last_forward_channel = {}  # user_id -> channel_id
 
 # ======================
 # LOAD SETTINGS
@@ -138,6 +139,19 @@ def build_kb(btns, rows=None, cols=None):
             kb.row(*row)
     return kb
 
+def copy_any(chat_id, msg, reply_markup=None):
+    ct = msg.content_type
+    if ct == "text":
+        bot.send_message(chat_id, msg.text, reply_markup=reply_markup)
+    elif ct == "photo":
+        bot.send_photo(chat_id, msg.photo[-1].file_id, caption=msg.caption or "", reply_markup=reply_markup)
+    elif ct == "video":
+        bot.send_video(chat_id, msg.video.file_id, caption=msg.caption or "", reply_markup=reply_markup)
+    elif ct == "document":
+        bot.send_document(chat_id, msg.document.file_id, caption=msg.caption or "", reply_markup=reply_markup)
+    else:
+        bot.copy_message(chat_id, msg.chat.id, msg.message_id)
+
 # ======================
 # /start
 # ======================
@@ -166,16 +180,16 @@ def help_cmd(m):
 /blockquote – create blockquote message
 /setbutton – add buttons to any replied message
 /set row column – set button layout
-/done – finish current action
-/texttourl – convert text to clickable URL
+/forward &lt;channel_id&gt; – forward copy
+/sendprechannel – send to last channel
+/done – finish action
+/texttourl – clickable links
 
 <b>👑 Owner Commands</b>
-/addchat <alias> <id>
-/listchat
-/removechat <alias>
-/sendto <alias>
-/setimage (reply)
-/setchannel <url|none>
+/addchat /listchat /removechat
+/sendto
+/setimage
+/setchannel
 /users
 """
     bot.send_message(m.chat.id, text)
@@ -186,7 +200,7 @@ def help_cmd(m):
 @bot.message_handler(commands=["blockquote"])
 def blockquote(m):
     blockquote_sessions[m.from_user.id] = []
-    bot.reply_to(m, "Send text line by line.\nEach line becomes a blockquote.\n/done to finish.")
+    bot.reply_to(m, "Send text line by line.\n/done to finish.")
 
 @bot.message_handler(func=lambda m: m.from_user.id in blockquote_sessions and not m.text.startswith("/"))
 def collect_block(m):
@@ -194,141 +208,57 @@ def collect_block(m):
     bot.reply_to(m, "➕ Added")
 
 # ======================
-# CHAT MANAGEMENT (OWNER)
+# /forward
 # ======================
-@bot.message_handler(commands=["addchat"])
-def addchat(m):
-    if not is_owner(m.from_user.id):
-        return
-    _, a, cid = m.text.split()
-    shared_chats[a] = int(cid)
-    cur.execute("INSERT INTO shared_chats VALUES (%s,%s) ON CONFLICT DO NOTHING", (a, cid))
-    db.commit()
-    bot.reply_to(m, "✅ Added")
-
-@bot.message_handler(commands=["listchat"])
-def listchat(m):
-    if not is_owner(m.from_user.id):
-        return
-    txt = "\n".join(f"{k} → {v}" for k, v in shared_chats.items()) or "Empty"
-    bot.send_message(m.chat.id, txt)
-
-@bot.message_handler(commands=["removechat"])
-def rmchat(m):
-    if not is_owner(m.from_user.id):
-        return
-    a = m.text.split()[1]
-    shared_chats.pop(a, None)
-    cur.execute("DELETE FROM shared_chats WHERE alias=%s", (a,))
-    db.commit()
-    bot.reply_to(m, "🗑 Removed")
-
-# ======================
-# /sendto
-# ======================
-@bot.message_handler(commands=["sendto"])
-def sendto(m):
-    if not is_owner(m.from_user.id) or not m.reply_to_message:
-        return
-    alias = m.text.split()[1]
-    cid = shared_chats.get(alias)
-    if cid:
-        bot.copy_message(cid, m.chat.id, m.reply_to_message.message_id)
-        bot.reply_to(m, "📤 Sent")
-
-# ======================
-# /texttourl
-# ======================
-@bot.message_handler(commands=["texttourl"])
-def text2url(m):
+@bot.message_handler(commands=["forward"])
+def forward_cmd(m):
     if not m.reply_to_message:
-        return
-    match = re.search(r"\{(.+?)\|(.+?)\}", m.reply_to_message.text)
-    if not match:
-        return
-    text, url = match.groups()
-    bot.send_message(m.chat.id, f'<a href="{url}">{text}</a>')
+        return bot.reply_to(m, "❌ Reply to a message.")
+    try:
+        cid = int(m.text.split()[1])
+    except:
+        return bot.reply_to(m, "❌ Usage: /forward <channel_id>")
+
+    copy_any(cid, m.reply_to_message, m.reply_to_message.reply_markup)
+    last_forward_channel[m.from_user.id] = cid
+    bot.reply_to(m, "📤 Sent & saved as previous channel")
 
 # ======================
-# /setimage
+# /sendprechannel
 # ======================
-@bot.message_handler(commands=["setimage"])
-def setimage(m):
-    if not is_owner(m.from_user.id):
-        return
-    if not m.reply_to_message or not m.reply_to_message.photo:
-        return
-    global start_photo_id, start_message
-    start_photo_id = m.reply_to_message.photo[-1].file_id
-    start_message = m.text.split(" ", 1)[1]
-    cur.execute("INSERT INTO settings VALUES ('start_image',%s) ON CONFLICT DO UPDATE SET value=%s",
-                (start_photo_id, start_photo_id))
-    cur.execute("INSERT INTO settings VALUES ('start_message',%s) ON CONFLICT DO UPDATE SET value=%s",
-                (start_message, start_message))
-    db.commit()
-    bot.reply_to(m, "✅ Updated")
-
-# ======================
-# /setbutton
-# ======================
-@bot.message_handler(commands=["setbutton"])
-def setbutton(m):
+@bot.message_handler(commands=["sendprechannel"])
+def send_prev(m):
     if not m.reply_to_message:
-        return
-    button_sessions[m.from_user.id] = {
-        "msg": m.reply_to_message,
-        "btns": [],
-        "r": None,
-        "c": None
-    }
-    bot.reply_to(m, "Send buttons as: Text | URL\n/set row col\n/done")
-
-@bot.message_handler(commands=["set"])
-def setgrid(m):
-    s = button_sessions.get(m.from_user.id)
-    if not s:
-        return
-    _, r, c = m.text.split()
-    s["r"], s["c"] = int(r), int(c)
-    bot.reply_to(m, "📐 Layout set")
-
-@bot.message_handler(func=lambda m: m.from_user.id in button_sessions and "|" in m.text)
-def collect_btn(m):
-    t, u = map(str.strip, m.text.split("|", 1))
-    button_sessions[m.from_user.id]["btns"].append((t, u))
-    bot.reply_to(m, "➕ Button added")
+        return bot.reply_to(m, "❌ Reply to a message.")
+    cid = last_forward_channel.get(m.from_user.id)
+    if not cid:
+        return bot.reply_to(m, "❌ No previous channel found.")
+    copy_any(cid, m.reply_to_message, m.reply_to_message.reply_markup)
+    bot.reply_to(m, "📤 Sent to previous channel")
 
 # ======================
-# /done (MULTI PURPOSE)
+# /done
 # ======================
 @bot.message_handler(commands=["done"])
 def done(m):
     uid = m.from_user.id
 
-    # blockquote done
     if uid in blockquote_sessions:
         lines = blockquote_sessions.pop(uid)
         msg = "".join(f"<blockquote>{l}</blockquote>\n" for l in lines)
         bot.send_message(m.chat.id, msg)
         return
 
-    # button done
     s = button_sessions.pop(uid, None)
     if not s:
         return
 
     kb = build_kb(s["btns"], s["r"], s["c"])
     kb = merge_kb(s["msg"].reply_markup, kb)
-
-    bot.copy_message(
-        m.chat.id,
-        m.chat.id,
-        s["msg"].message_id,
-        reply_markup=kb
-    )
+    copy_any(m.chat.id, s["msg"], kb)
 
 # ======================
-# FLASK (RENDER)
+# FLASK
 # ======================
 app = Flask(__name__)
 

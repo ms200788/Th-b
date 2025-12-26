@@ -1,198 +1,347 @@
 import os
 import re
-import asyncio
-import gc
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-from telethon.tl.types import DocumentAttributeVideo
-from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.errors import FloodWaitError
-from PIL import Image
-from aiohttp import web
+import threading
+from datetime import datetime, timedelta
 
-# ================= ENV =================
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-TG_SESSION = os.environ["TG_SESSION"]
-TARGET_CHANNEL = int(os.environ["TARGET_CHANNEL"])
-CHANNEL_INVITE = os.environ["CHANNEL_INVITE"]
-PORT = int(os.environ.get("PORT", 10000))
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from flask import Flask
 
-# ================= PATHS =================
-TMP = "/tmp/work"
-os.makedirs(TMP, exist_ok=True)
+import telebot
+from telebot import types
 
-thumb_src = os.path.join(TMP, "thumb_src.jpg")
-thumb_final = os.path.join(TMP, "thumb.jpg")
+# ======================
+# ENV
+# ======================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+DATABASE_URL = os.getenv("DATABASE_URL")
+CREATED_CHANNEL_ID = int(os.getenv("CREATED_CHANNEL_ID", "0"))
 
-current_thumb = None
-rename_template = None
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# ================= CLIENT =================
-client = TelegramClient(
-    StringSession(TG_SESSION),
-    API_ID,
-    API_HASH,
-    connection_retries=5,
-    timeout=60
+# ======================
+# DATABASE
+# ======================
+db = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+cur = db.cursor()
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
 )
+""")
 
-# ================= THUMB =================
-def optimize_thumbnail(src, dst):
-    img = Image.open(src).convert("RGB")
-    w, h = img.size
+cur.execute("""
+CREATE TABLE IF NOT EXISTS shared_chats (
+    alias TEXT PRIMARY KEY,
+    chat_id BIGINT
+)
+""")
 
-    if max(w, h) > 320:
-        ratio = 320 / max(w, h)
-        img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS user_activity (
+    user_id BIGINT PRIMARY KEY,
+    last_seen TIMESTAMP NOT NULL
+)
+""")
 
-    for q in range(90, 30, -5):
-        img.save(dst, "JPEG", quality=q)
-        if os.path.getsize(dst) <= 200 * 1024:
-            return
+db.commit()
 
-    img.save(dst, "JPEG", quality=25)
+# ======================
+# GLOBAL STATE
+# ======================
+start_photo_id = None
+start_message = None
+force_channels = []
+shared_chats = {}
 
-# ================= HELPERS =================
-def extract_episode(text, file_name):
-    patterns = [
-        r"[Ee][Pp][\s\-_:]*([0-9]+)",
-        r"[Ee][\s\-_:]*([0-9]+)",
-        r"episode[\s\-_:]*([0-9]+)",
-        r"ep([0-9]+)",
-        r"e([0-9]+)"
-    ]
-    check = (text or "") + " " + (file_name or "")
-    for pat in patterns:
-        m = re.search(pat, check)
-        if m:
-            return m.group(1)
-    return ""
+blockquote_sessions = {}
+button_sessions = {}
 
-def clean_filename(name):
-    return re.sub(r"[^\w\-. ]", "_", name)
+# ======================
+# LOAD SETTINGS
+# ======================
+cur.execute("SELECT * FROM settings")
+for r in cur.fetchall():
+    if r["key"] == "start_image":
+        start_photo_id = r["value"]
+    elif r["key"] == "start_message":
+        start_message = r["value"]
+    elif r["key"] == "force_channels":
+        force_channels = r["value"].split(",")
 
-# ================= SINGLE PROCESS LOCK =================
-processing_lock = asyncio.Lock()
+cur.execute("SELECT * FROM shared_chats")
+for r in cur.fetchall():
+    shared_chats[r["alias"]] = r["chat_id"]
 
-# ================= HANDLER =================
-@client.on(events.NewMessage)
-async def handler(event):
-    global current_thumb, rename_template
+# ======================
+# HELPERS
+# ======================
+def is_owner(uid):
+    return uid == OWNER_ID
 
-    msg = event.message
+def track_user(uid):
+    cur.execute("""
+        INSERT INTO user_activity (user_id,last_seen)
+        VALUES (%s,NOW())
+        ON CONFLICT (user_id)
+        DO UPDATE SET last_seen=NOW()
+    """, (uid,))
+    cur.execute("DELETE FROM user_activity WHERE last_seen < NOW() - INTERVAL '7 days'")
+    db.commit()
 
-    if not event.is_private:
-        return
-    if msg.peer_id.user_id != (await client.get_me()).id:
-        return
+def check_force(uid):
+    for url in force_channels:
+        uname = url.rstrip("/").split("/")[-1]
+        try:
+            m = bot.get_chat_member(uname, uid)
+            if m.status not in ("member", "administrator", "creator"):
+                return False
+        except:
+            return False
+    return True
 
-    # Rename
-    if msg.raw_text.startswith("/rename"):
-        parts = msg.raw_text.split(" ", 1)
-        if len(parts) == 1 or parts[1].lower() == "none":
-            rename_template = None
-            await event.reply("🟦 Rename OFF.")
-        else:
-            rename_template = parts[1].strip()
-            await event.reply(f"🟩 Rename template set:\n`{rename_template}`")
-        return
+def join_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    for u in force_channels:
+        kb.add(types.InlineKeyboardButton("📢 Join Channel", url=u))
+    return kb
 
-    # Thumbnail
-    if msg.photo:
-        src = await msg.download_media(file=thumb_src)
-        optimize_thumbnail(src, thumb_final)
-        current_thumb = thumb_final
-        await event.reply("✅ Thumbnail saved.")
-        return
+def merge_kb(old, new):
+    if not old:
+        return new
+    kb = types.InlineKeyboardMarkup()
+    for r in old.keyboard:
+        kb.keyboard.append(r)
+    for r in new.keyboard:
+        kb.keyboard.append(r)
+    return kb
 
-    # Detect video
-    is_video = False
-    duration = 1
-    file_name = msg.file.name if msg.file else ""
+def build_kb(btns, rows=None, cols=None):
+    kb = types.InlineKeyboardMarkup()
+    if not rows or not cols:
+        for t, u in btns:
+            kb.add(types.InlineKeyboardButton(t, url=u))
+        return kb
+    i = 0
+    for _ in range(rows):
+        row = []
+        for _ in range(cols):
+            if i >= len(btns):
+                break
+            t, u = btns[i]
+            row.append(types.InlineKeyboardButton(t, url=u))
+            i += 1
+        if row:
+            kb.row(*row)
+    return kb
 
-    if msg.video:
-        is_video = True
-        duration = msg.video.duration or 1
+# ======================
+# /start
+# ======================
+@bot.message_handler(commands=["start"])
+def start_cmd(m):
+    track_user(m.from_user.id)
 
-    if msg.document:
-        for a in msg.document.attributes:
-            if isinstance(a, DocumentAttributeVideo):
-                is_video = True
-                duration = a.duration or 1
-
-    if not is_video or not current_thumb:
-        return
-
-    async with processing_lock:
-        await event.reply("⬇ Downloading…")
-        path = await msg.download_media(
-            file=os.path.join(TMP, f"video_{msg.id}")
+    if force_channels and not check_force(m.from_user.id):
+        return bot.send_message(
+            m.chat.id,
+            "⚠️ Please join required channels to use the bot.",
+            reply_markup=join_keyboard()
         )
 
-        final_path = path
-        if rename_template:
-            ep = extract_episode(msg.text or "", file_name)
-            name = rename_template.replace("{ep}", ep)
-            if not name.lower().endswith(".mp4"):
-                name += ".mp4"
-            final_path = os.path.join(TMP, clean_filename(name))
-            os.rename(path, final_path)
+    if start_photo_id and start_message:
+        txt = start_message.replace("{first_name}", m.from_user.first_name or "")
+        bot.send_photo(m.chat.id, start_photo_id, caption=txt)
 
-        await event.reply("⬆ Uploading…")
+# ======================
+# /help
+# ======================
+@bot.message_handler(commands=["help"])
+def help_cmd(m):
+    text = """
+<b>📌 User Commands</b>
+/blockquote – create blockquote message
+/setbutton – add buttons to any replied message
+/set row column – set button layout
+/done – finish current action
+/texttourl – convert text to clickable URL
 
-        try:
-            try:
-                await client.send_file(
-                    TARGET_CHANNEL,
-                    final_path,
-                    caption=msg.text or "",
-                    thumb=current_thumb,
-                    attributes=[DocumentAttributeVideo(
-                        duration=duration,
-                        w=1280,
-                        h=720,
-                        supports_streaming=True
-                    )],
-                    part_size_kb=1024   # 🚀 SPEED FIX
-                )
-            except FloodWaitError as e:
-                await asyncio.sleep(e.seconds + 5)
-                raise
+<b>👑 Owner Commands</b>
+/addchat <alias> <id>
+/listchat
+/removechat <alias>
+/sendto <alias>
+/setimage (reply)
+/setchannel <url|none>
+/users
+"""
+    bot.send_message(m.chat.id, text)
 
-            await event.reply("✔ Uploaded.")
+# ======================
+# /blockquote
+# ======================
+@bot.message_handler(commands=["blockquote"])
+def blockquote(m):
+    blockquote_sessions[m.from_user.id] = []
+    bot.reply_to(m, "Send text line by line.\nEach line becomes a blockquote.\n/done to finish.")
 
-            # Cooldown to avoid silent throttle
-            await asyncio.sleep(8)
+@bot.message_handler(func=lambda m: m.from_user.id in blockquote_sessions and not m.text.startswith("/"))
+def collect_block(m):
+    blockquote_sessions[m.from_user.id].append(m.text.strip())
+    bot.reply_to(m, "➕ Added")
 
-        finally:
-            if os.path.exists(final_path):
-                os.remove(final_path)
-            gc.collect()
+# ======================
+# CHAT MANAGEMENT (OWNER)
+# ======================
+@bot.message_handler(commands=["addchat"])
+def addchat(m):
+    if not is_owner(m.from_user.id):
+        return
+    _, a, cid = m.text.split()
+    shared_chats[a] = int(cid)
+    cur.execute("INSERT INTO shared_chats VALUES (%s,%s) ON CONFLICT DO NOTHING", (a, cid))
+    db.commit()
+    bot.reply_to(m, "✅ Added")
 
-# ================= AIOHTTP HEALTH =================
-async def health(request):
-    return web.Response(text="OK")
+@bot.message_handler(commands=["listchat"])
+def listchat(m):
+    if not is_owner(m.from_user.id):
+        return
+    txt = "\n".join(f"{k} → {v}" for k, v in shared_chats.items()) or "Empty"
+    bot.send_message(m.chat.id, txt)
 
-async def web_server():
-    app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
+@bot.message_handler(commands=["removechat"])
+def rmchat(m):
+    if not is_owner(m.from_user.id):
+        return
+    a = m.text.split()[1]
+    shared_chats.pop(a, None)
+    cur.execute("DELETE FROM shared_chats WHERE alias=%s", (a,))
+    db.commit()
+    bot.reply_to(m, "🗑 Removed")
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+# ======================
+# /sendto
+# ======================
+@bot.message_handler(commands=["sendto"])
+def sendto(m):
+    if not is_owner(m.from_user.id) or not m.reply_to_message:
+        return
+    alias = m.text.split()[1]
+    cid = shared_chats.get(alias)
+    if cid:
+        bot.copy_message(cid, m.chat.id, m.reply_to_message.message_id)
+        bot.reply_to(m, "📤 Sent")
 
-# ================= MAIN =================
-async def main():
-    await client.start()
-    try:
-        await client(ImportChatInviteRequest(CHANNEL_INVITE))
-    except:
-        pass
+# ======================
+# /texttourl
+# ======================
+@bot.message_handler(commands=["texttourl"])
+def text2url(m):
+    if not m.reply_to_message:
+        return
+    match = re.search(r"\{(.+?)\|(.+?)\}", m.reply_to_message.text)
+    if not match:
+        return
+    text, url = match.groups()
+    bot.send_message(m.chat.id, f'<a href="{url}">{text}</a>')
 
-    asyncio.create_task(web_server())
-    await client.run_until_disconnected()
+# ======================
+# /setimage
+# ======================
+@bot.message_handler(commands=["setimage"])
+def setimage(m):
+    if not is_owner(m.from_user.id):
+        return
+    if not m.reply_to_message or not m.reply_to_message.photo:
+        return
+    global start_photo_id, start_message
+    start_photo_id = m.reply_to_message.photo[-1].file_id
+    start_message = m.text.split(" ", 1)[1]
+    cur.execute("INSERT INTO settings VALUES ('start_image',%s) ON CONFLICT DO UPDATE SET value=%s",
+                (start_photo_id, start_photo_id))
+    cur.execute("INSERT INTO settings VALUES ('start_message',%s) ON CONFLICT DO UPDATE SET value=%s",
+                (start_message, start_message))
+    db.commit()
+    bot.reply_to(m, "✅ Updated")
 
-asyncio.run(main())
+# ======================
+# /setbutton
+# ======================
+@bot.message_handler(commands=["setbutton"])
+def setbutton(m):
+    if not m.reply_to_message:
+        return
+    button_sessions[m.from_user.id] = {
+        "msg": m.reply_to_message,
+        "btns": [],
+        "r": None,
+        "c": None
+    }
+    bot.reply_to(m, "Send buttons as: Text | URL\n/set row col\n/done")
+
+@bot.message_handler(commands=["set"])
+def setgrid(m):
+    s = button_sessions.get(m.from_user.id)
+    if not s:
+        return
+    _, r, c = m.text.split()
+    s["r"], s["c"] = int(r), int(c)
+    bot.reply_to(m, "📐 Layout set")
+
+@bot.message_handler(func=lambda m: m.from_user.id in button_sessions and "|" in m.text)
+def collect_btn(m):
+    t, u = map(str.strip, m.text.split("|", 1))
+    button_sessions[m.from_user.id]["btns"].append((t, u))
+    bot.reply_to(m, "➕ Button added")
+
+# ======================
+# /done (MULTI PURPOSE)
+# ======================
+@bot.message_handler(commands=["done"])
+def done(m):
+    uid = m.from_user.id
+
+    # blockquote done
+    if uid in blockquote_sessions:
+        lines = blockquote_sessions.pop(uid)
+        msg = "".join(f"<blockquote>{l}</blockquote>\n" for l in lines)
+        bot.send_message(m.chat.id, msg)
+        return
+
+    # button done
+    s = button_sessions.pop(uid, None)
+    if not s:
+        return
+
+    kb = build_kb(s["btns"], s["r"], s["c"])
+    kb = merge_kb(s["msg"].reply_markup, kb)
+
+    bot.copy_message(
+        m.chat.id,
+        m.chat.id,
+        s["msg"].message_id,
+        reply_markup=kb
+    )
+
+# ======================
+# FLASK (RENDER)
+# ======================
+app = Flask(__name__)
+
+@app.route("/")
+def ok():
+    return "OK"
+
+def run_web():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+
+# ======================
+# RUN
+# ======================
+if __name__ == "__main__":
+    threading.Thread(target=run_web).start()
+    bot.infinity_polling()

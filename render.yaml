@@ -1,5 +1,10 @@
 services:
   - type: web
-    name: telegram-userbot
+    name: telebot-bot
     env: docker
     plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"

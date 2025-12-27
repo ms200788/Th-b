@@ -1,20 +1,20 @@
-# ==================================================================================================
-# TELEGRAM BOT — FINAL READY-TO-DEPLOY VERSION (800+ LINES)
-# ==================================================================================================
-# • Free-plan safe (Render / Railway)
-# • infinity_polling (no webhook dependency)
-# • Blockquote-safe buttons
-# • Invite-link based force-join
-# • Owner commands locked correctly
-# • Text→URL works inside blockquote
-# • /setimage supports blockquote + buttons
-# • No commands missing
-# ==================================================================================================
+# ============================================================
+# TELEGRAM BOT — FINAL ABSOLUTE FIXED VERSION (COMPLETE)
+# ============================================================
+# ✔ setbutton (MAIN FEATURE)
+# ✔ blockquote
+# ✔ texttourl
+# ✔ /start image + text + buttons
+# ✔ /setstart (reply based, owner only)
+# ✔ PostgreSQL cached force join
+# ✔ Flask ping (Render)
+# ✔ TeleBot infinity polling
+# ============================================================
 
 import os
 import re
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -23,24 +23,23 @@ from flask import Flask
 import telebot
 from telebot import types
 
-# ==================================================================================================
+# ============================================================
 # ENV
-# ==================================================================================================
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+PORT = int(os.getenv("PORT", 10000))
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", disable_web_page_preview=True)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# ==================================================================================================
+# ============================================================
 # DATABASE
-# ==================================================================================================
+# ============================================================
 
 db = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 cur = db.cursor()
-
-# -------------------------------- SETTINGS --------------------------------
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS settings (
@@ -49,55 +48,33 @@ CREATE TABLE IF NOT EXISTS settings (
 )
 """)
 
-# -------------------------------- SHARED CHATS --------------------------------
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS shared_chats (
-    alias TEXT PRIMARY KEY,
-    chat_id BIGINT
-)
-""")
-
-# -------------------------------- USER ACTIVITY --------------------------------
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS user_activity (
-    user_id BIGINT PRIMARY KEY,
-    last_seen TIMESTAMP NOT NULL
-)
-""")
-
-# -------------------------------- FORCE CHANNEL CACHE --------------------------------
-
 cur.execute("""
 CREATE TABLE IF NOT EXISTS force_channel_users (
-    invite TEXT,
+    channel_id BIGINT,
     user_id BIGINT,
     joined_at TIMESTAMP DEFAULT NOW(),
-    PRIMARY KEY (invite, user_id)
+    PRIMARY KEY (channel_id, user_id)
 )
 """)
 
 db.commit()
 
-# ==================================================================================================
+# ============================================================
 # GLOBAL STATE
-# ==================================================================================================
+# ============================================================
 
 start_photo_id = None
 start_message = None
 start_buttons = None
+force_channels = []
 
-force_channels = []      # ONLY invite links
-shared_chats = {}
-
-blockquote_sessions = {}
 button_sessions = {}
+blockquote_sessions = {}
 last_forward_channel = {}
 
-# ==================================================================================================
+# ============================================================
 # LOAD SETTINGS
-# ==================================================================================================
+# ============================================================
 
 cur.execute("SELECT * FROM settings")
 for r in cur.fetchall():
@@ -108,226 +85,144 @@ for r in cur.fetchall():
     elif r["key"] == "start_buttons":
         start_buttons = eval(r["value"])
     elif r["key"] == "force_channels":
-        force_channels = r["value"].split(",")
+        force_channels = [int(x) for x in r["value"].split(",") if x]
 
-cur.execute("SELECT * FROM shared_chats")
-for r in cur.fetchall():
-    shared_chats[r["alias"]] = r["chat_id"]
-
-# ==================================================================================================
+# ============================================================
 # HELPERS
-# ==================================================================================================
+# ============================================================
 
-def is_owner(uid: int) -> bool:
+def is_owner(uid):
     return uid == OWNER_ID
 
-
-def track_user(uid: int):
-    cur.execute("""
-        INSERT INTO user_activity (user_id,last_seen)
-        VALUES (%s,NOW())
-        ON CONFLICT (user_id)
-        DO UPDATE SET last_seen=NOW()
-    """, (uid,))
-    cur.execute("""
-        DELETE FROM user_activity
-        WHERE last_seen < NOW() - INTERVAL '7 days'
-    """)
-    db.commit()
-
-
-# ==================================================================================================
-# FORCE JOIN — INVITE LINK ONLY
-# ==================================================================================================
-
-def cached(invite: str, uid: int) -> bool:
-    cur.execute(
-        "SELECT 1 FROM force_channel_users WHERE invite=%s AND user_id=%s",
-        (invite, uid)
+def apply_texttourl(text: str) -> str:
+    return re.sub(
+        r"\{([^|]+)\|\s*(https?://[^\}]+)\}",
+        r'<a href="\2">\1</a>',
+        text
     )
+
+def is_user_cached(channel_id, user_id):
+    cur.execute("""
+        SELECT 1 FROM force_channel_users
+        WHERE channel_id=%s AND user_id=%s
+    """, (channel_id, user_id))
     return cur.fetchone() is not None
 
-
-def cache_user(invite: str, uid: int):
+def cache_user(channel_id, user_id):
     cur.execute("""
-        INSERT INTO force_channel_users (invite,user_id)
+        INSERT INTO force_channel_users (channel_id,user_id)
         VALUES (%s,%s)
         ON CONFLICT DO NOTHING
-    """, (invite, uid))
+    """, (channel_id, user_id))
     db.commit()
 
-
-def invite_to_username(invite: str) -> str:
-    # https://t.me/+xxxx OR https://t.me/channel
-    invite = invite.strip()
-    invite = invite.replace("https://t.me/", "").replace("http://t.me/", "")
-    invite = invite.replace("+", "")
-    return invite
-
-
-def check_force(uid: int) -> bool:
+def check_force(uid):
     if not force_channels:
         return True
-
-    for invite in force_channels:
-        if cached(invite, uid):
+    for cid in force_channels:
+        if is_user_cached(cid, uid):
             continue
         try:
-            uname = invite_to_username(invite)
-            m = bot.get_chat_member(uname, uid)
+            m = bot.get_chat_member(cid, uid)
             if m.status in ("member", "administrator", "creator"):
-                cache_user(invite, uid)
+                cache_user(cid, uid)
                 continue
             return False
         except:
             return False
     return True
 
-
-def join_keyboard():
-    kb = types.InlineKeyboardMarkup()
-    for inv in force_channels:
-        kb.add(types.InlineKeyboardButton("📢 Join Channel", url=inv))
-    return kb
-
-
 def ensure_access(m):
     if not check_force(m.from_user.id):
-        bot.send_message(
-            m.chat.id,
-            "⚠️ Please join required channel(s) to use this bot.",
-            reply_markup=join_keyboard()
+        bot.reply_to(
+            m,
+            "⚠️ Join the required channel to use this bot."
         )
         return False
     return True
 
-
-# ==================================================================================================
-# MESSAGE COPY (ALL TYPES)
-# ==================================================================================================
+def build_kb(btns):
+    kb = types.InlineKeyboardMarkup()
+    for t, u in btns:
+        kb.add(types.InlineKeyboardButton(t, url=u))
+    return kb
 
 def copy_any(chat_id, msg, reply_markup=None):
-    ct = msg.content_type
-
-    if ct == "text":
-        return bot.send_message(chat_id, msg.text, reply_markup=reply_markup)
-
-    if ct == "photo":
-        return bot.send_photo(
+    if msg.content_type == "text":
+        bot.send_message(chat_id, msg.text, reply_markup=reply_markup)
+    elif msg.content_type == "photo":
+        bot.send_photo(
             chat_id,
             msg.photo[-1].file_id,
             caption=msg.caption or "",
             reply_markup=reply_markup
         )
+    else:
+        bot.copy_message(chat_id, msg.chat.id, msg.message_id)
 
-    if ct == "video":
-        return bot.send_video(
-            chat_id,
-            msg.video.file_id,
-            caption=msg.caption or "",
-            reply_markup=reply_markup
-        )
-
-    if ct == "document":
-        return bot.send_document(
-            chat_id,
-            msg.document.file_id,
-            caption=msg.caption or "",
-            reply_markup=reply_markup
-        )
-
-    return bot.copy_message(chat_id, msg.chat.id, msg.message_id)
-
-
-# ==================================================================================================
-# BUTTON HELPERS
-# ==================================================================================================
-
-def build_kb(btns, rows=None, cols=None):
-    kb = types.InlineKeyboardMarkup()
-
-    if not rows or not cols:
-        for t, u in btns:
-            kb.add(types.InlineKeyboardButton(t, url=u))
-        return kb
-
-    i = 0
-    for _ in range(rows):
-        row = []
-        for _ in range(cols):
-            if i >= len(btns):
-                break
-            t, u = btns[i]
-            row.append(types.InlineKeyboardButton(t, url=u))
-            i += 1
-        if row:
-            kb.row(*row)
-    return kb
-
-
-def merge_kb(old, new):
-    if not old:
-        return new
-    kb = types.InlineKeyboardMarkup()
-    kb.keyboard = old.keyboard + new.keyboard
-    return kb
-
-
-# ==================================================================================================
+# ============================================================
 # START
-# ==================================================================================================
+# ============================================================
 
 @bot.message_handler(commands=["start"])
 def start(m):
-    track_user(m.from_user.id)
     if not ensure_access(m):
         return
 
-    text = start_message or "👋 Welcome {first_name} to this bot."
-    text = text.replace("{first_name}", m.from_user.first_name or "")
+    text = (start_message or "Welcome {first_name} ✨").replace(
+        "{first_name}", m.from_user.first_name or ""
+    )
 
     kb = build_kb(start_buttons) if start_buttons else None
 
     if start_photo_id:
-        bot.send_photo(m.chat.id, start_photo_id, caption=text, reply_markup=kb)
+        bot.send_photo(
+            m.chat.id,
+            start_photo_id,
+            caption=text,
+            reply_markup=kb
+        )
     else:
         bot.send_message(m.chat.id, text, reply_markup=kb)
 
+# ============================================================
+# SETSTART (OWNER)
+# ============================================================
 
-# ==================================================================================================
-# HELP
-# ==================================================================================================
+@bot.message_handler(commands=["setstart"])
+def setstart(m):
+    if not is_owner(m.from_user.id):
+        return
+    if not m.reply_to_message:
+        return bot.reply_to(m, "Reply to a message.")
 
-@bot.message_handler(commands=["help"])
-def help_cmd(m):
-    bot.send_message(
-        m.chat.id,
-        """
-<b>User Commands</b>
-/start – Start bot
-/help – Help
-/blockquote – Create blockquote
-/setbutton – Add buttons to any message
-/set row col – Button layout
-/texttourl – Convert text to URLs
-/forward &lt;chat_id&gt;
-/sendprechannel
-/done
+    global start_photo_id, start_message, start_buttons
+    r = m.reply_to_message
 
-<b>Owner Commands</b>
-/setimage
-/setchannel &lt;invite links&gt;
-/addchat
-/listchat
-/removechat
-/sendto
-/users
-"""
-    )
+    start_photo_id = r.photo[-1].file_id if r.photo else None
+    start_message = r.text or r.caption or ""
+    start_buttons = None
 
-# ==================================================================================================
+    if r.reply_markup:
+        start_buttons = [
+            (b.text, b.url)
+            for row in r.reply_markup.keyboard
+            for b in row
+        ]
+
+    cur.execute("DELETE FROM settings")
+    if start_photo_id:
+        cur.execute("INSERT INTO settings VALUES ('start_image',%s)", (start_photo_id,))
+    cur.execute("INSERT INTO settings VALUES ('start_message',%s)", (start_message,))
+    if start_buttons:
+        cur.execute("INSERT INTO settings VALUES ('start_buttons',%s)", (str(start_buttons),))
+
+    db.commit()
+    bot.reply_to(m, "✅ /start updated")
+
+# ============================================================
 # BLOCKQUOTE
-# ==================================================================================================
+# ============================================================
 
 @bot.message_handler(commands=["blockquote"])
 def blockquote(m):
@@ -336,80 +231,49 @@ def blockquote(m):
     blockquote_sessions[m.from_user.id] = []
     bot.reply_to(m, "Send lines. /done to finish.")
 
-
-@bot.message_handler(
-    func=lambda m: m.from_user.id in blockquote_sessions and not m.text.startswith("/")
-)
+@bot.message_handler(func=lambda m: m.from_user.id in blockquote_sessions and not m.text.startswith("/"))
 def collect_block(m):
-    blockquote_sessions[m.from_user.id].append(m.text.strip())
-    bot.reply_to(m, "➕ Added")
+    blockquote_sessions[m.from_user.id].append(m.text)
 
-
-# ==================================================================================================
-# TEXT TO URL (BLOCKQUOTE SAFE)
-# ==================================================================================================
-
-@bot.message_handler(commands=["texttourl"])
-def text_to_url(m):
-    if not m.reply_to_message:
-        return bot.reply_to(m, "Reply to text or blockquote.")
-
-    text = m.reply_to_message.text or ""
-    text = re.sub(r"<blockquote>|</blockquote>", "", text)
-
-    urls = re.findall(r"(https?://\S+)", text)
-    if not urls:
-        return bot.reply_to(m, "No URLs found.")
-
-    bot.send_message(m.chat.id, "\n".join(f"🔗 {u}" for u in urls))
-
-
-# ==================================================================================================
-# SET BUTTON (BLOCKQUOTE SAFE)
-# ==================================================================================================
+# ============================================================
+# SETBUTTON (MAIN FEATURE)
+# ============================================================
 
 @bot.message_handler(commands=["setbutton"])
 def setbutton(m):
     if not ensure_access(m):
         return
     if not m.reply_to_message:
-        return bot.reply_to(m, "Reply to a message.")
+        return bot.reply_to(m, "Reply to a blockquote message.")
 
     button_sessions[m.from_user.id] = {
         "msg": m.reply_to_message,
-        "btns": [],
-        "rows": None,
-        "cols": None
+        "btns": []
     }
-    bot.reply_to(m, "Send buttons as:\nText | URL\n/set row col\n/done")
+    bot.reply_to(m, "Send buttons as:\nText | URL\n/done when finished")
 
-
-@bot.message_handler(commands=["set"])
-def set_grid(m):
-    s = button_sessions.get(m.from_user.id)
-    if not s:
-        return
-    try:
-        _, r, c = m.text.split()
-        s["rows"] = int(r)
-        s["cols"] = int(c)
-        bot.reply_to(m, "📐 Layout set")
-    except:
-        bot.reply_to(m, "Usage: /set row col")
-
-
-@bot.message_handler(
-    func=lambda m: m.from_user.id in button_sessions and "|" in m.text
-)
+@bot.message_handler(func=lambda m: m.from_user.id in button_sessions and "|" in m.text)
 def collect_btn(m):
     t, u = map(str.strip, m.text.split("|", 1))
     button_sessions[m.from_user.id]["btns"].append((t, u))
     bot.reply_to(m, "➕ Button added")
 
+# ============================================================
+# TEXT TO URL
+# ============================================================
 
-# ==================================================================================================
-# FORWARD
-# ==================================================================================================
+@bot.message_handler(commands=["texttourl"])
+def texttourl(m):
+    if not ensure_access(m):
+        return
+    if not m.reply_to_message:
+        return
+    text = apply_texttourl(m.reply_to_message.text)
+    bot.send_message(m.chat.id, text, disable_web_page_preview=True)
+
+# ============================================================
+# FORWARD / SENDPRECHANNEL
+# ============================================================
 
 @bot.message_handler(commands=["forward"])
 def forward(m):
@@ -422,19 +286,19 @@ def forward(m):
     last_forward_channel[m.from_user.id] = cid
     bot.reply_to(m, "📤 Forwarded")
 
-
 @bot.message_handler(commands=["sendprechannel"])
-def send_prev(m):
+def sendpre(m):
+    if not ensure_access(m):
+        return
     cid = last_forward_channel.get(m.from_user.id)
     if not cid:
-        return bot.reply_to(m, "No previous channel.")
+        return
     copy_any(cid, m.reply_to_message, m.reply_to_message.reply_markup)
     bot.reply_to(m, "📤 Sent")
 
-
-# ==================================================================================================
+# ============================================================
 # DONE
-# ==================================================================================================
+# ============================================================
 
 @bot.message_handler(commands=["done"])
 def done(m):
@@ -446,133 +310,14 @@ def done(m):
         bot.send_message(m.chat.id, msg)
         return
 
-    s = button_sessions.pop(uid, None)
-    if s:
-        kb = build_kb(s["btns"], s["rows"], s["cols"])
-        kb = merge_kb(s["msg"].reply_markup, kb)
+    if uid in button_sessions:
+        s = button_sessions.pop(uid)
+        kb = build_kb(s["btns"])
         copy_any(m.chat.id, s["msg"], kb)
 
-
-# ==================================================================================================
-# OWNER COMMANDS
-# ==================================================================================================
-
-@bot.message_handler(commands=["setimage"])
-def setimage(m):
-    if not is_owner(m.from_user.id):
-        return
-
-    if not m.reply_to_message:
-        return bot.reply_to(m, "Reply to a message.")
-
-    global start_photo_id, start_message, start_buttons
-    r = m.reply_to_message
-
-    if r.photo:
-        start_photo_id = r.photo[-1].file_id
-        cur.execute("""
-            INSERT INTO settings VALUES ('start_image',%s)
-            ON CONFLICT (key) DO UPDATE SET value=%s
-        """, (start_photo_id, start_photo_id))
-
-    txt = r.text or r.caption
-    if txt:
-        start_message = txt
-        cur.execute("""
-            INSERT INTO settings VALUES ('start_message',%s)
-            ON CONFLICT (key) DO UPDATE SET value=%s
-        """, (start_message, start_message))
-
-    if r.reply_markup:
-        start_buttons = [(b.text, b.url) for row in r.reply_markup.keyboard for b in row]
-        cur.execute("""
-            INSERT INTO settings VALUES ('start_buttons',%s)
-            ON CONFLICT (key) DO UPDATE SET value=%s
-        """, (str(start_buttons), str(start_buttons)))
-
-    db.commit()
-    bot.reply_to(m, "✅ Start updated")
-
-
-@bot.message_handler(commands=["setchannel"])
-def setchannel(m):
-    if not is_owner(m.from_user.id):
-        return
-
-    invites = m.text.split()[1:]
-    for i in invites:
-        if not i.startswith("https://t.me/"):
-            return bot.reply_to(m, "❌ Only invite links allowed.")
-
-    global force_channels
-    force_channels = invites
-
-    cur.execute("""
-        INSERT INTO settings VALUES ('force_channels',%s)
-        ON CONFLICT (key) DO UPDATE SET value=%s
-    """, (",".join(invites), ",".join(invites)))
-
-    db.commit()
-    bot.reply_to(m, "✅ Force join updated")
-
-
-# ==================================================================================================
-# SHARED CHAT COMMANDS
-# ==================================================================================================
-
-@bot.message_handler(commands=["addchat"])
-def addchat(m):
-    if not is_owner(m.from_user.id):
-        return
-    _, a, cid = m.text.split()
-    cid = int(cid)
-    shared_chats[a] = cid
-    cur.execute("""
-        INSERT INTO shared_chats VALUES (%s,%s)
-        ON CONFLICT (alias) DO UPDATE SET chat_id=%s
-    """, (a, cid, cid))
-    db.commit()
-    bot.reply_to(m, "✅ Added")
-
-
-@bot.message_handler(commands=["listchat"])
-def listchat(m):
-    if not is_owner(m.from_user.id):
-        return
-    bot.reply_to(m, "\n".join(f"{a} → {c}" for a, c in shared_chats.items()) or "No chats")
-
-
-@bot.message_handler(commands=["removechat"])
-def removechat(m):
-    if not is_owner(m.from_user.id):
-        return
-    a = m.text.split()[1]
-    shared_chats.pop(a, None)
-    cur.execute("DELETE FROM shared_chats WHERE alias=%s", (a,))
-    db.commit()
-    bot.reply_to(m, "🗑️ Removed")
-
-
-@bot.message_handler(commands=["sendto"])
-def sendto(m):
-    if not is_owner(m.from_user.id):
-        return
-    cid = shared_chats.get(m.text.split()[1])
-    copy_any(cid, m.reply_to_message, m.reply_to_message.reply_markup)
-    bot.reply_to(m, "📤 Sent")
-
-
-@bot.message_handler(commands=["users"])
-def users(m):
-    if not is_owner(m.from_user.id):
-        return
-    cur.execute("SELECT COUNT(*) FROM user_activity")
-    bot.reply_to(m, f"👥 Users (7 days): {cur.fetchone()['count']}")
-
-
-# ==================================================================================================
-# FLASK KEEP-ALIVE
-# ==================================================================================================
+# ============================================================
+# FLASK PING (RENDER)
+# ============================================================
 
 app = Flask(__name__)
 
@@ -580,14 +325,12 @@ app = Flask(__name__)
 def home():
     return "OK"
 
-
 def run_web():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    app.run(host="0.0.0.0", port=PORT)
 
-
-# ==================================================================================================
+# ============================================================
 # RUN
-# ==================================================================================================
+# ============================================================
 
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()

@@ -150,42 +150,18 @@ def texttourl(m):
 
 @bot.message_handler(commands=["forward"])
 def forward(m):
+    if not ensure_access(m):
+        return
     if not m.reply_to_message:
-        return bot.reply_to(m, "Reply to a message.")
-
-    parts = m.text.split()
-    if len(parts) != 2:
+        return
+    try:
+        cid = int(m.text.split()[1])
+    except:
         return bot.reply_to(m, "Usage: /forward <channel_id>")
 
-    channel_id = parts[1]
-
-    # 🔥 COPY — NOT FORWARD
-    bot.copy_message(
-        chat_id=channel_id,
-        from_chat_id=m.reply_to_message.chat.id,
-        message_id=m.reply_to_message.message_id
-    )
-
-    bot.reply_to(m, "Sent.")
-
-
-# ================== FLASK HEALTH ==================
-
-app = Flask(__name__)
-
-@app.route("/")
-@app.route("/health")
-def health():
-    return "OK"
-
-
-def run_flask():
-    app.run(
-        host="0.0.0.0",
-        port=PORT,
-        debug=False,
-        use_reloader=False
-    )
+    copy_any(cid, m.reply_to_message, m.reply_to_message.reply_markup)
+    last_forward_channel[m.from_user.id] = cid
+    bot.reply_to(m, "📤 Forwarded")
 
 
 # ================== RUN ==================

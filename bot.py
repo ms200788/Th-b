@@ -116,28 +116,19 @@ def done(m):
 
 @bot.message_handler(commands=["blockquote"])
 def blockquote(m):
-    if not m.reply_to_message or not m.reply_to_message.text:
-        return bot.reply_to(m, "Reply to a text message.")
+    if not ensure_access(m):
+        return
+    blockquote_sessions[m.from_user.id] = []
+    bot.reply_to(m, "Send lines. /done to finish.")
 
-    original = m.reply_to_message.text
-    lines = original.splitlines()
 
-    blocks = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        line = convert_texttourl(line)
-        blocks.append(f"<blockquote>{line}</blockquote>")
-
-    if not blocks:
-        return bot.reply_to(m, "Nothing to blockquote.")
-
-    bot.send_message(
-        m.chat.id,
-        "\n".join(blocks),
-        disable_web_page_preview=True
-    )
+@bot.message_handler(
+    func=lambda m: m.from_user.id in blockquote_sessions
+    and not m.text.startswith("/")
+)
+def collect_block(m):
+    blockquote_sessions[m.from_user.id].append(m.text.strip())
+    bot.reply_to(m, "➕ Added")
 
 # ================== TEXT TO URL ==================
 

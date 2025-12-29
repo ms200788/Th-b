@@ -13,6 +13,8 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # ================== STATE ==================
 button_sessions = {}
+blockquote_sessions = {}
+last_forward_channel = {}
 
 # ================== HELPERS ==================
 
@@ -46,6 +48,14 @@ def convert_texttourl(text):
     return re.sub(r"\{([^|]+)\|\s*([^}]+)\}", repl, text)
 
 
+def copy_any(chat_id, msg, reply_markup=None):
+    return bot.copy_message(
+        chat_id=chat_id,
+        from_chat_id=msg.chat.id,
+        message_id=msg.message_id,
+        reply_markup=reply_markup
+    )
+
 # ================== SETBUTTON ==================
 
 @bot.message_handler(commands=["setbutton"])
@@ -60,10 +70,7 @@ def setbutton(m):
         "cols": None
     }
 
-    bot.reply_to(
-        m,
-        "Send buttons:\nText | URL\n\n/set rows cols\n/done"
-    )
+    bot.reply_to(m, "Send buttons:\nText | URL\n\n/set rows cols\n/done")
 
 
 @bot.message_handler(commands=["set"])
@@ -83,52 +90,27 @@ def set_layout(m):
 
 @bot.message_handler(func=lambda m: m.from_user.id in button_sessions and "|" in (m.text or ""))
 def collect_button(m):
-    session = button_sessions[m.from_user.id]
+    s = button_sessions[m.from_user.id]
     t, u = map(str.strip, m.text.split("|", 1))
-    session["buttons"].append((t, u))
-    bot.reply_to(m, "Button added.")
-
-
-@bot.message_handler(commands=["done"])
-def done(m):
-    session = button_sessions.pop(m.from_user.id, None)
-    if not session:
-        return
-
-    kb = build_keyboard(
-        session["buttons"],
-        session["rows"],
-        session["cols"]
-    )
-
-    msg = session["msg"]
-
-    # 🔥 COPY MESSAGE — FORMAT SAFE (TEXT / MEDIA / BLOCKQUOTE)
-    bot.copy_message(
-        chat_id=m.chat.id,
-        from_chat_id=msg.chat.id,
-        message_id=msg.message_id,
-        reply_markup=kb
-    )
-
+    s["buttons"].append((t, u))
+    bot.reply_to(m, "➕ Button added")
 
 # ================== BLOCKQUOTE ==================
 
 @bot.message_handler(commands=["blockquote"])
 def blockquote(m):
-    if not ensure_access(m):
-        return
     blockquote_sessions[m.from_user.id] = []
-    bot.reply_to(m, "Send lines. /done to finish.")
+    bot.reply_to(m, "Send lines. Use /done when finished.")
 
 
 @bot.message_handler(
-    func=lambda m: m.from_user.id in blockquote_sessions
-    and not m.text.startswith("/")
+    func=lambda m: m.from_user.id in blockquote_sessions and not m.text.startswith("/")
 )
 def collect_block(m):
-    blockquote_sessions[m.from_user.id].append(m.text.strip())
-    bot.reply_to(m, "➕ Added")
+    line = m.text.strip()
+    if line:
+        blockquote_sessions[m.from_user.id].append(line)
+        bot.reply_to(m, "➕ Added")
 
 # ================== TEXT TO URL ==================
 
@@ -138,88 +120,55 @@ def texttourl(m):
         return bot.reply_to(m, "Reply to text.")
 
     text = convert_texttourl(m.reply_to_message.text)
-
-    bot.send_message(
-        m.chat.id,
-        text,
-        disable_web_page_preview=True
-    )
-
+    bot.send_message(m.chat.id, text, disable_web_page_preview=True)
 
 # ================== FORWARD (COPY) ==================
 
 @bot.message_handler(commands=["forward"])
 def forward(m):
-    if not ensure_access(m):
-        return
     if not m.reply_to_message:
-        return
+        return bot.reply_to(m, "Reply to a message.")
+
     try:
         cid = int(m.text.split()[1])
     except:
         return bot.reply_to(m, "Usage: /forward <channel_id>")
 
     copy_any(cid, m.reply_to_message, m.reply_to_message.reply_markup)
-    last_forward_channel[m.from_user.id] = cid
-    bot.reply_to(m, "📤 Forwarded")
+    bot.reply_to(m, "📤 Sent")
 
-
-
+# ================== DONE (UNIFIED) ==================
 
 @bot.message_handler(commands=["done"])
 def done(m):
     uid = m.from_user.id
 
+    # BLOCKQUOTE DONE
     if uid in blockquote_sessions:
         lines = blockquote_sessions.pop(uid)
-        msg = "".join(f"<blockquote>{l}</blockquote>\n" for l in lines)
-        bot.send_message(m.chat.id, msg)
+        msg = "\n".join(
+            f"<blockquote>{convert_texttourl(l)}</blockquote>"
+            for l in lines
+        )
+        bot.send_message(m.chat.id, msg, disable_web_page_preview=True)
         return
 
-    s = button_sessions.pop(uid, None)
-    if s:
-        kb = build_kb(s["btns"], s["rows"], s["cols"])
-        kb = merge_kb(s["msg"].reply_markup, kb)
+    # SETBUTTON DONE
+    if uid in button_sessions:
+        s = button_sessions.pop(uid)
+        kb = build_keyboard(s["buttons"], s["rows"], s["cols"])
         copy_any(m.chat.id, s["msg"], kb)
 
+# ================== FLASK HEALTH ==================
 
+app = Flask(__name__)
 
-def copy_any(chat_id, msg, reply_markup=None):
-    ct = msg.content_type
+@app.route("/health")
+def health():
+    return "OK"
 
-    if ct == "text":
-        return bot.send_message(
-            chat_id,
-            msg.text,
-            reply_markup=reply_markup
-        )
-
-    if ct == "photo":
-        return bot.send_photo(
-            chat_id,
-            msg.photo[-1].file_id,
-            caption=msg.caption or "",
-            reply_markup=reply_markup
-        )
-
-    if ct == "video":
-        return bot.send_video(
-            chat_id,
-            msg.video.file_id,
-            caption=msg.caption or "",
-            reply_markup=reply_markup
-        )
-
-    if ct == "document":
-        return bot.send_document(
-            chat_id,
-            msg.document.file_id,
-            caption=msg.caption or "",
-            reply_markup=reply_markup
-        )
-
-    return bot.copy_message(chat_id, msg.chat.id, msg.message_id)
-
+def run_flask():
+    app.run(host="0.0.0.0", port=PORT)
 
 # ================== RUN ==================
 

@@ -1,243 +1,170 @@
 import os
 import re
-import asyncio
-import asyncpg
-from aiohttp import web
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    MessageEntity,
-)
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+import threading
+from flask import Flask
+import telebot
+from telebot import types
 
 # ================== ENV ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-PORT = int(os.getenv("PORT", "8080"))
+PORT = 10000
 
-# ================== DB ==================
-db = None
+bot = telebot.TeleBot(BOT_TOKEN)
 
-async def init_db():
-    global db
-    db = await asyncpg.create_pool(DATABASE_URL)
-    async with db.acquire() as con:
-        await con.execute("""
-        CREATE TABLE IF NOT EXISTS joined_users (
-            user_id BIGINT PRIMARY KEY
-        );
-        """)
-        await con.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
-        """)
-
-async def set_setting(key, value):
-    async with db.acquire() as con:
-        await con.execute(
-            "INSERT INTO settings VALUES ($1,$2) "
-            "ON CONFLICT (key) DO UPDATE SET value=$2",
-            key, value
-        )
-
-async def get_setting(key):
-    async with db.acquire() as con:
-        row = await con.fetchrow("SELECT value FROM settings WHERE key=$1", key)
-        return row["value"] if row else None
-
-async def is_joined(user_id):
-    async with db.acquire() as con:
-        row = await con.fetchrow(
-            "SELECT 1 FROM joined_users WHERE user_id=$1", user_id
-        )
-        return bool(row)
-
-async def mark_joined(user_id):
-    async with db.acquire() as con:
-        await con.execute(
-            "INSERT INTO joined_users VALUES ($1) ON CONFLICT DO NOTHING",
-            user_id
-        )
+# ================== STATE ==================
+button_sessions = {}
+last_forward = {}
 
 # ================== HELPERS ==================
 
-def extract_buttons(text):
-    rows = []
-    for line in text.splitlines():
-        m = re.search(r"\[(.+?)\]\((.+?)\)", line)
-        if m:
-            label, url = m.group(1), m.group(2)
-            rows.append([InlineKeyboardButton(label, url=url)])
-    return InlineKeyboardMarkup(rows) if rows else None
+def parse_buttons(lines):
+    buttons = []
+    for line in lines:
+        if "|" in line:
+            text, url = line.split("|", 1)
+            buttons.append((text.strip(), url.strip()))
+    return buttons
 
-def apply_texttourl(html):
+def build_keyboard(buttons, rows=None, cols=None):
+    kb = types.InlineKeyboardMarkup()
+    if not rows or not cols:
+        for t, u in buttons:
+            kb.add(types.InlineKeyboardButton(t, url=u))
+        return kb
+
+    i = 0
+    for _ in range(rows):
+        row = []
+        for _ in range(cols):
+            if i >= len(buttons):
+                break
+            t, u = buttons[i]
+            row.append(types.InlineKeyboardButton(t, url=u))
+            i += 1
+        if row:
+            kb.row(*row)
+    return kb
+
+def convert_texttourl(text):
     def repl(m):
         word, url = m.group(1).strip(), m.group(2).strip()
         if not url.startswith("http"):
             url = "https://" + url
         return f'<a href="{url}">{word}</a>'
-    return re.sub(r"\{([^|]+)\|\s*([^}]+)\}", repl, html)
-
-def rebuild_blockquote(msg):
-    if not msg.entities:
-        return msg.html_text or msg.text
-
-    for e in msg.entities:
-        if e.type == MessageEntity.BLOCKQUOTE:
-            part = msg.text[e.offset:e.offset + e.length]
-            return f"<blockquote>{part}</blockquote>"
-
-    return msg.html_text or msg.text
-
-async def force_join(update: Update):
-    channel = await get_setting("channel")
-    if not channel:
-        return True
-
-    user = update.effective_user
-    if await is_joined(user.id):
-        return True
-
-    try:
-        await update.get_bot().get_chat_member(channel, user.id)
-        await mark_joined(user.id)
-        return True
-    except:
-        await update.message.reply_text(
-            f"Join the channel first:\n{channel}"
-        )
-        return False
-
-async def send_preserved(update, kb=None, apply_url=False):
-    msg = update.message.reply_to_message
-    html = rebuild_blockquote(msg)
-    if apply_url:
-        html = apply_texttourl(html)
-
-    await update.message.reply_text(
-        html,
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-        disable_web_page_preview=True
-    )
+    return re.sub(r"\{([^|]+)\|\s*([^}]+)\}", repl, text)
 
 # ================== COMMANDS ==================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = await get_setting("start_text") or "Welcome {first_name} ✨"
-    text = text.replace("{first_name}", update.effective_user.first_name)
-    kb = extract_buttons(text)
-    await update.message.reply_text(text, reply_markup=kb)
+@bot.message_handler(commands=["setbutton"])
+def setbutton(m):
+    if not m.reply_to_message:
+        return bot.reply_to(m, "Reply to a message.")
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "/setbutton\n/set\n/blockquote\n/texttourl\n/forward\n/sendprechannel"
+    button_sessions[m.from_user.id] = {
+        "msg": m.reply_to_message,
+        "buttons": [],
+        "rows": None,
+        "cols": None
+    }
+    bot.reply_to(
+        m,
+        "Send buttons as:\nText | URL\n\n/set rows cols\n/done"
     )
 
-async def setstart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
+@bot.message_handler(commands=["set"])
+def set_layout(m):
+    session = button_sessions.get(m.from_user.id)
+    if not session:
         return
-    if not update.message.reply_to_message:
-        return
-    msg = update.message.reply_to_message
-    html = msg.html_text or msg.text
-    await set_setting("start_text", html)
-    await update.message.reply_text("Start message updated")
+    try:
+        _, r, c = m.text.split()
+        session["rows"] = int(r)
+        session["cols"] = int(c)
+        bot.reply_to(m, "Layout set.")
+    except:
+        bot.reply_to(m, "Usage: /set rows cols")
 
-async def setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-    if not context.args:
-        return
-    await set_setting("channel", context.args[0])
-    await update.message.reply_text("Channel set")
+@bot.message_handler(
+    func=lambda m: m.from_user.id in button_sessions and "|" in m.text
+)
+def collect_button(m):
+    session = button_sessions[m.from_user.id]
+    t, u = map(str.strip, m.text.split("|", 1))
+    session["buttons"].append((t, u))
+    bot.reply_to(m, "Button added.")
 
-async def setbutton(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await force_join(update):
+@bot.message_handler(commands=["done"])
+def done(m):
+    session = button_sessions.pop(m.from_user.id, None)
+    if not session:
         return
-    if not update.message.reply_to_message:
-        return
-    kb = extract_buttons(update.message.text or "")
-    await send_preserved(update, kb=kb)
 
-async def set_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await setbutton(update, context)
-
-async def blockquote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await force_join(update):
-        return
-    if not update.message.reply_to_message:
-        return
-    msg = update.message.reply_to_message
-    html = apply_texttourl(msg.text)
-    await update.message.reply_text(
-        f"<blockquote>{html}</blockquote>",
-        parse_mode=ParseMode.HTML
+    kb = build_keyboard(
+        session["buttons"],
+        session["rows"],
+        session["cols"]
     )
 
-async def texttourl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await force_join(update):
+    msg = session["msg"]
+
+    # COPY MESSAGE = FORMAT SAFE
+    bot.copy_message(
+        chat_id=m.chat.id,
+        from_chat_id=msg.chat.id,
+        message_id=msg.message_id,
+        reply_markup=kb
+    )
+
+@bot.message_handler(commands=["blockquote"])
+def blockquote(m):
+    if not m.reply_to_message or not m.reply_to_message.text:
+        return bot.reply_to(m, "Reply to text.")
+
+    text = convert_texttourl(m.reply_to_message.text)
+    bot.send_message(
+        m.chat.id,
+        f"<blockquote>{text}</blockquote>",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+@bot.message_handler(commands=["texttourl"])
+def texttourl(m):
+    if not m.reply_to_message or not m.reply_to_message.text:
+        return bot.reply_to(m, "Reply to text.")
+
+    text = convert_texttourl(m.reply_to_message.text)
+    bot.send_message(
+        m.chat.id,
+        text,
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+@bot.message_handler(commands=["forward"])
+def forward(m):
+    if not m.reply_to_message:
         return
-    if not update.message.reply_to_message:
-        return
-    await send_preserved(update, apply_url=True)
+    last_forward[m.from_user.id] = m.reply_to_message
+    bot.forward_message(
+        m.chat.id,
+        m.reply_to_message.chat.id,
+        m.reply_to_message.message_id
+    )
 
-async def forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await force_join(update):
-        return
-    if update.message.reply_to_message:
-        await update.message.reply_to_message.forward(
-            update.effective_chat.id
-        )
+# ================== FLASK HEALTH ==================
 
-async def sendprechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await force_join(update):
-        return
-    ch = await get_setting("channel")
-    if ch and update.message.reply_to_message:
-        await update.message.reply_to_message.forward(ch)
+app = Flask(__name__)
 
-# ================== PING ==================
+@app.route("/health")
+def health():
+    return "OK"
 
-async def ping(_):
-    return web.Response(text="OK")
+def run_flask():
+    app.run(host="0.0.0.0", port=PORT)
 
-async def start_ping():
-    app = web.Application()
-    app.router.add_get("/", ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-
-# ================== MAIN ==================
-
-async def main():
-    await init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("setstart", setstart))
-    app.add_handler(CommandHandler("setchannel", setchannel))
-    app.add_handler(CommandHandler("setbutton", setbutton))
-    app.add_handler(CommandHandler("set", set_alias))
-    app.add_handler(CommandHandler("blockquote", blockquote_cmd))
-    app.add_handler(CommandHandler("texttourl", texttourl))
-    app.add_handler(CommandHandler("forward", forward))
-    app.add_handler(CommandHandler("sendprechannel", sendprechannel))
-
-    asyncio.create_task(start_ping())
-    await app.run_polling()
+# ================== RUN ==================
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    threading.Thread(target=run_flask, daemon=True).start()
+    bot.infinity_polling(skip_pending=True)

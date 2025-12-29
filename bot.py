@@ -164,6 +164,24 @@ def forward(m):
     bot.reply_to(m, "📤 Forwarded")
 
 
+
+
+@bot.message_handler(commands=["done"])
+def done(m):
+    uid = m.from_user.id
+
+    if uid in blockquote_sessions:
+        lines = blockquote_sessions.pop(uid)
+        msg = "".join(f"<blockquote>{l}</blockquote>\n" for l in lines)
+        bot.send_message(m.chat.id, msg)
+        return
+
+    s = button_sessions.pop(uid, None)
+    if s:
+        kb = build_kb(s["btns"], s["rows"], s["cols"])
+        kb = merge_kb(s["msg"].reply_markup, kb)
+        copy_any(m.chat.id, s["msg"], kb)
+
 # ================== RUN ==================
 
 if __name__ == "__main__":

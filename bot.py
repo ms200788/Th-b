@@ -182,6 +182,45 @@ def done(m):
         kb = merge_kb(s["msg"].reply_markup, kb)
         copy_any(m.chat.id, s["msg"], kb)
 
+
+
+def copy_any(chat_id, msg, reply_markup=None):
+    ct = msg.content_type
+
+    if ct == "text":
+        return bot.send_message(
+            chat_id,
+            msg.text,
+            reply_markup=reply_markup
+        )
+
+    if ct == "photo":
+        return bot.send_photo(
+            chat_id,
+            msg.photo[-1].file_id,
+            caption=msg.caption or "",
+            reply_markup=reply_markup
+        )
+
+    if ct == "video":
+        return bot.send_video(
+            chat_id,
+            msg.video.file_id,
+            caption=msg.caption or "",
+            reply_markup=reply_markup
+        )
+
+    if ct == "document":
+        return bot.send_document(
+            chat_id,
+            msg.document.file_id,
+            caption=msg.caption or "",
+            reply_markup=reply_markup
+        )
+
+    return bot.copy_message(chat_id, msg.chat.id, msg.message_id)
+
+
 # ================== RUN ==================
 
 if __name__ == "__main__":
